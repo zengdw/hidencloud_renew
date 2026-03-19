@@ -225,7 +225,75 @@ class HidenCloudBot:
                 invoice_links.append(self.normalize_url(href))
         return sorted(set(invoice_links))
 
-    def try_handle_invoice_from_response(self, service_id, response):
+    def extract_form_payload(self, form):
+        payload = {}
+
+        for field in form.find_all(['input', 'select', 'textarea']):
+            name = field.get('name')
+            if not name or field.has_attr('disabled'):
+                continue
+
+            tag_name = field.name.lower()
+            if tag_name == 'input':
+                field_type = (field.get('type') or '').lower()
+                if field_type in ('checkbox', 'radio') and not field.has_attr('checked'):
+                    continue
+                payload[name] = field.get('value', '')
+            elif tag_name == 'select':
+                option = field.find('option', selected=True) or field.find('option')
+                payload[name] = option.get('value', '') if option else ''
+            else:
+                payload[name] = field.get_text()
+
+        return payload
+
+    def find_renew_form(self, soup, service_id):
+        exact_path = f"/service/{service_id}/renew"
+        fallback_form = None
+        fallback_action = ""
+
+        for form in soup.find_all('form'):
+            action = form.get('action', '')
+            if not action:
+                continue
+
+            action_url = self.normalize_url(action)
+            if exact_path in action_url:
+                return form, action_url
+
+            form_text = form.get_text(" ", strip=True)
+            if '/renew' in action_url or 'renew' in form_text.lower() or '续期' in form_text:
+                fallback_form = form
+                fallback_action = action_url
+
+        return fallback_form, fallback_action
+
+    def fetch_manage_page(self, service_id):
+        manage_res = self.request('GET', f"/service/{service_id}/manage")
+        soup = BeautifulSoup(manage_res.text, 'html.parser')
+        self._refresh_csrf(soup)
+        return manage_res, soup
+
+    def submit_renew_request(self, service_id, soup, referer_url):
+        form, action_url = self.find_renew_form(soup, service_id)
+        payload = self.extract_form_payload(form) if form else {}
+
+        token_input = soup.find('input', attrs={'name': '_token'})
+        if token_input and not payload.get('_token'):
+            payload['_token'] = token_input.get('value', '')
+
+        payload['days'] = RENEW_DAYS
+
+        target_url = action_url or self.normalize_url(f"/service/{service_id}/renew")
+        headers = {
+            'X-CSRF-TOKEN': self.csrf_token,
+            'Referer': referer_url,
+            'Origin': self.base_url,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        }
+        return self.request('POST', target_url, data=payload, headers=headers)
+
+    def try_handle_invoice_from_response(self, service_id, response, allow_invoice_poll=True):
         if '/invoice/' in response.url:
             self.log("⚡️ 续期成功，已跳转账单页，自动执行支付...")
             self.perform_pay_from_html(response.text, response.url)
@@ -244,8 +312,11 @@ class HidenCloudBot:
             self.log(f"⚠️ 续期请求被服务端拒绝，页面提示: {err_div.get_text(strip=True)}")
             return True
 
+        if not allow_invoice_poll:
+            return False
+
         if response.status_code == 419:
-            self.log("⚠️ 续期请求返回 419，账单可能已创建但页面未跳转，开始延长轮询账单...")
+            self.log("⚠️ 续期请求返回 419，重试后仍未跳转，开始检查是否生成账单...")
         else:
             self.log(f"⚠️ 提交成功但未自动跳转，响应URL: {response.url} | 状态码: {response.status_code}")
             self.log("后置轮询检查账单...")
@@ -290,9 +361,7 @@ class HidenCloudBot:
             self.check_and_pay_invoices(service['id'], is_precheck=True)
 
             # 2. 获取管理页面，同时刷新 CSRF token
-            manage_res = self.request('GET', f"/service/{service['id']}/manage")
-            soup = BeautifulSoup(manage_res.text, 'html.parser')
-            self._refresh_csrf(soup)
+            manage_res, soup = self.fetch_manage_page(service['id'])
 
             # ================== 3. 检测是否允许续期 ==================
             renew_btn = soup.find('button', onclick=re.compile(r'showRenewAlert'))
@@ -316,17 +385,16 @@ class HidenCloudBot:
                 self.log("❌ 无法找到续期 Token (可能是服务已到期或页面结构变更)")
                 return
 
-            form_token = token_input['value']
             self.log(f"提交续期 ({RENEW_DAYS}天)...")
             sleep_random(1000, 2000)
 
-            payload = {'_token': form_token, 'days': RENEW_DAYS}
-            headers = {
-                'X-CSRF-TOKEN': self.csrf_token,
-                'Referer': f"https://dash.hidencloud.com/service/{service['id']}/manage"
-            }
+            res = self.submit_renew_request(service['id'], soup, manage_res.url)
 
-            res = self.request('POST', f"/service/{service['id']}/renew", data=payload, headers=headers)
+            if not self.try_handle_invoice_from_response(service['id'], res, allow_invoice_poll=False) and res.status_code == 419:
+                self.log("♻️ 首次续期请求返回 419，刷新管理页获取新 Token 后重试一次...")
+                sleep_random(1000, 2000)
+                manage_res, soup = self.fetch_manage_page(service['id'])
+                res = self.submit_renew_request(service['id'], soup, manage_res.url)
 
             # ================== 5. 结果校验与支付 ==================
             self.try_handle_invoice_from_response(service['id'], res)
