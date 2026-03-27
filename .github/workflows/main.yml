@@ -18,10 +18,10 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    - name: Install Cloudflare WARP
-      uses: fscarmen/warp-on-actions@v1.4
-      with:
-        stack: ipv4
+    # - name: Install Cloudflare WARP
+    #   uses: fscarmen/warp-on-actions@v1.4
+    #   with:
+    #     stack: ipv4
 
     - name: Setup Python
       uses: actions/setup-python@v5
